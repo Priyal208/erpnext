@@ -17,6 +17,7 @@ from frappe.utils import (
 	cint,
 	cstr,
 	flt,
+	format_datetime,
 	get_datetime,
 	get_link_to_form,
 	getdate,
@@ -298,10 +299,20 @@ class SerialandBatchBundle(Document):
 
 		for serial_no in serial_nos:
 			if not serial_no_warehouse.get(serial_no) or serial_no_warehouse.get(serial_no) != self.warehouse:
-				self.throw_error_message(
-					f"Serial No {bold(serial_no)} is not present in the warehouse {bold(self.warehouse)}.",
-					SerialNoWarehouseError,
-				)
+				reservation = get_serial_no_reservation(self.item_code, serial_no, self.warehouse)
+				if reservation:
+					self.throw_error_message(
+						f"Serial No {bold(serial_no)} is in warehouse {bold(self.warehouse)}"
+						f" but is reserved for {reservation.voucher_type} {bold(reservation.voucher_no)}"
+						f" via {get_link_to_form('Stock Reservation Entry', reservation.name)}."
+						f" Please use an unreserved serial number or cancel the reservation.",
+						SerialNoWarehouseError,
+					)
+				else:
+					self.throw_error_message(
+						f"Serial No {bold(serial_no)} is not present in the warehouse {bold(self.warehouse)}.",
+						SerialNoWarehouseError,
+					)
 
 	def validate_serial_nos_duplicate(self):
 		# Don't inward same serial number multiple times
@@ -1026,6 +1037,8 @@ class SerialandBatchBundle(Document):
 			qty_field = "consumed_qty"
 		elif row.get("doctype") == "Stock Entry Detail":
 			qty_field = "transfer_qty"
+		elif row.get("doctype") in ["Sales Invoice Item", "Purchase Invoice Item"]:
+			qty_field = "stock_qty"
 
 		return qty_field
 
@@ -1458,22 +1471,33 @@ class SerialandBatchBundle(Document):
 			if flt(available_qty, precision) < 0:
 				self.throw_negative_batch(d.batch_no, available_qty, precision)
 
-	def throw_negative_batch(self, batch_no, available_qty, precision):
+	def throw_negative_batch(self, batch_no, available_qty, precision, posting_datetime=None):
 		from erpnext.stock.stock_ledger import NegativeStockError
 
 		if frappe.db.get_single_value("Stock Settings", "allow_negative_stock_for_batch"):
 			return
 
+		date_msg = ""
+		if posting_datetime:
+			date_msg = " " + _("as of {0}").format(format_datetime(posting_datetime))
+
+		msg = _(
+			"""
+			The Batch {0} of an item {1} has negative stock in the warehouse {2}{3}.
+			Please add a stock quantity of {4} to proceed with this entry.
+			If it is not possible to make an adjustment entry, please enable 'Allow Negative Stock for Batch' in Stock Settings to proceed.
+			However, enabling this setting may lead to negative stock in the system.
+			So please ensure the stock levels are adjusted as soon as possible to maintain the correct valuation rate."""
+		).format(
+			bold(batch_no),
+			bold(self.item_code),
+			bold(self.warehouse),
+			date_msg,
+			bold(abs(flt(available_qty, precision))),
+		)
+
 		frappe.throw(
-			_(
-				"""
-			The Batch {0} of an item {1} has negative stock in the warehouse {2}. Please add a stock quantity of {3} to proceed with this entry."""
-			).format(
-				bold(batch_no),
-				bold(self.item_code),
-				bold(self.warehouse),
-				bold(abs(flt(available_qty, precision))),
-			),
+			msg,
 			title=_("Negative Stock Error"),
 			exc=NegativeStockError,
 		)
@@ -1496,7 +1520,9 @@ class SerialandBatchBundle(Document):
 				available_qty[row.batch_no] = flt(row.qty)
 
 			if flt(available_qty[row.batch_no], precision) < 0:
-				self.throw_negative_batch(row.batch_no, available_qty[row.batch_no], precision)
+				self.throw_negative_batch(
+					row.batch_no, available_qty[row.batch_no], precision, row.posting_datetime
+				)
 
 		return available_qty
 
@@ -1530,10 +1556,13 @@ class SerialandBatchBundle(Document):
 	def get_available_qty_from_sabb(self):
 		batches = [d.batch_no for d in self.entries if d.batch_no]
 
+		sle = frappe.qb.DocType("Stock Ledger Entry")
 		child = frappe.qb.DocType("Serial and Batch Entry")
 
 		query = (
 			frappe.qb.from_(child)
+			.inner_join(sle)
+			.on(child.parent == sle.serial_and_batch_bundle)
 			.select(
 				child.batch_no,
 				child.qty,
@@ -1542,6 +1571,7 @@ class SerialandBatchBundle(Document):
 			)
 			.where(
 				(child.item_code == self.item_code)
+				& (sle.is_cancelled == 0)
 				& (child.warehouse == self.warehouse)
 				& (child.is_cancelled == 0)
 				& (child.batch_no.isin(batches))
@@ -1555,6 +1585,9 @@ class SerialandBatchBundle(Document):
 		return query.run(as_dict=True)
 
 	def validate_voucher_no_docstatus(self):
+		if self.is_cancelled:
+			return
+
 		if self.voucher_type == "POS Invoice":
 			return
 
@@ -2560,6 +2593,32 @@ def get_reserved_serial_nos_for_sre(kwargs) -> list:
 		query = query.where(sre.name.notin(kwargs.ignore_voucher_nos))
 
 	return query.run(as_dict=True)
+
+
+def get_serial_no_reservation(item_code: str, serial_no: str, warehouse: str) -> _dict | None:
+	"""Returns the Stock Reservation Entry that has reserved the given serial number, if any."""
+
+	sre = frappe.qb.DocType("Stock Reservation Entry")
+	sb_entry = frappe.qb.DocType("Serial and Batch Entry")
+	result = (
+		frappe.qb.from_(sre)
+		.inner_join(sb_entry)
+		.on(sre.name == sb_entry.parent)
+		.select(sre.name, sre.voucher_type, sre.voucher_no)
+		.where(
+			(sre.docstatus == 1)
+			& (sre.item_code == item_code)
+			& (sre.warehouse == warehouse)
+			& (sre.status.notin(["Delivered", "Cancelled", "Closed"]))
+			& (sre.reservation_based_on == "Serial and Batch")
+			& (sb_entry.serial_no == serial_no)
+			& (sb_entry.qty != sb_entry.delivered_qty)
+		)
+		.limit(1)
+		.run(as_dict=True)
+	)
+
+	return result[0] if result else None
 
 
 def get_reserved_batches_for_pos(kwargs) -> dict:
