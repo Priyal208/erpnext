@@ -26,10 +26,8 @@
   "dimension_col_break",
   "project",
   "entries_section",
-  "filter_receivables",
   "receivables",
   "column_break_entries",
-  "filter_payables",
   "payables",
   "allocation_section",
   "allocation"
@@ -197,16 +195,6 @@
    "fieldtype": "Table",
    "label": "Allocation",
    "options": "Payment Reconciliation Allocation"
-  },
-  {
-   "fieldname": "filter_receivables",
-   "fieldtype": "Data",
-   "label": "Filter Receivables"
-  },
-  {
-   "fieldname": "filter_payables",
-   "fieldtype": "Data",
-   "label": "Filter Payables"
   }
  ],
  "hide_toolbar": 1,
