@@ -14,11 +14,11 @@
   "filters_section",
   "from_date",
   "min_amount",
-  "receivable_limit",
+  "to_receive_limit",
   "column_break_filters_1",
   "to_date",
   "max_amount",
-  "payable_limit",
+  "to_pay_limit",
   "column_break_filters_2",
   "currency_filter",
   "accounting_dimensions_section",
@@ -26,9 +26,9 @@
   "dimension_col_break",
   "project",
   "entries_section",
-  "receivables",
+  "to_receive",
   "column_break_entries",
-  "payables",
+  "to_pay",
   "allocation_section",
   "allocation"
  ],
@@ -82,7 +82,7 @@
   },
   {
    "collapsible": 1,
-   "collapsible_depends_on": "eval: doc.receivables.length == 0 && doc.payables.length == 0",
+   "collapsible_depends_on": "eval: doc.to_receive.length == 0 && doc.to_pay.length == 0",
    "depends_on": "eval:doc.party",
    "fieldname": "filters_section",
    "fieldtype": "Section Break",
@@ -101,9 +101,9 @@
   {
    "default": "50",
    "description": "System will fetch all entries if limit is zero.",
-   "fieldname": "receivable_limit",
+   "fieldname": "to_receive_limit",
    "fieldtype": "Int",
-   "label": "Receivable Limit"
+   "label": "To Receive Limit"
   },
   {
    "fieldname": "column_break_filters_1",
@@ -122,9 +122,9 @@
   {
    "default": "50",
    "description": "System will fetch all entries if limit is zero.",
-   "fieldname": "payable_limit",
+   "fieldname": "to_pay_limit",
    "fieldtype": "Int",
-   "label": "Payable Limit"
+   "label": "To Pay Limit"
   },
   {
    "fieldname": "column_break_filters_2",
@@ -139,7 +139,7 @@
   },
   {
    "collapsible": 1,
-   "collapsible_depends_on": "eval: doc.receivables.length == 0 && doc.payables.length == 0",
+   "collapsible_depends_on": "eval: doc.to_receive.length == 0 && doc.to_pay.length == 0",
    "depends_on": "eval:doc.party",
    "fieldname": "accounting_dimensions_section",
    "fieldtype": "Section Break",
@@ -162,16 +162,15 @@
    "options": "Project"
   },
   {
-   "depends_on": "eval:(doc.receivables).length || (doc.payables).length",
-   "description": "If you need to reconcile particular entries against each other, please select accordingly. Otherwise all entries will be allocated in FIFO order, bucketed by currency.",
+   "depends_on": "eval:(doc.to_receive).length || (doc.to_pay).length",
    "fieldname": "entries_section",
    "fieldtype": "Section Break",
    "label": "Unreconciled Entries"
   },
   {
-   "fieldname": "receivables",
+   "fieldname": "to_receive",
    "fieldtype": "Table",
-   "label": "Receivables",
+   "label": "To Receive",
    "options": "Payment Reconciliation Entry"
   },
   {
@@ -179,9 +178,9 @@
    "fieldtype": "Column Break"
   },
   {
-   "fieldname": "payables",
+   "fieldname": "to_pay",
    "fieldtype": "Table",
-   "label": "Payables",
+   "label": "To Pay",
    "options": "Payment Reconciliation Entry"
   },
   {
