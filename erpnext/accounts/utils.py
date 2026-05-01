@@ -2366,6 +2366,7 @@ class QueryPaymentLedger:
 			qb.from_(ple)
 			.select(
 				ple.account,
+				ple.account_type,
 				ple.voucher_type,
 				ple.voucher_no,
 				ple.party_type,
@@ -2422,6 +2423,7 @@ class QueryPaymentLedger:
 			)
 			.select(
 				Table("vouchers").account,
+				Table("vouchers").account_type,
 				Table("vouchers").voucher_type,
 				Table("vouchers").voucher_no,
 				Table("vouchers").party_type,
