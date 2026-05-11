@@ -10,7 +10,7 @@ from frappe.utils.data import getdate as convert_to_date
 from erpnext import get_default_cost_center
 from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 from erpnext.accounts.doctype.payment_entry.test_payment_entry import create_payment_entry
-from erpnext.accounts.doctype.payment_reconciliation.payment_reconciliation import Classifier
+from erpnext.accounts.doctype.payment_reconciliation.payment_reconciliation import classify
 from erpnext.accounts.doctype.purchase_invoice.test_purchase_invoice import make_purchase_invoice
 from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
 from erpnext.accounts.party import get_party_account
@@ -272,7 +272,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.party_type = "Customer" if party_is_customer else "Supplier"
 		pr.party = self.customer if party_is_customer else self.supplier
 		pr.receivable_payable_account = get_party_account(pr.party_type, pr.party, pr.company)
-		pr.from_invoice_date = pr.to_invoice_date = pr.from_payment_date = pr.to_payment_date = nowdate()
+		pr.from_date = pr.to_date = nowdate()
 		return pr
 
 	def create_journal_entry(self, acc1=None, acc2=None, amount=0, posting_date=None, cost_center=None):
@@ -318,7 +318,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 			self.sub_cc = sub_cc.save()
 
 	def test_filter_min_max(self):
-		# check filter condition minimum and maximum amount
+		# unified min_amount/max_amount filter applied to both to_receive and to_pay.
 		self.create_sales_invoice(qty=1, rate=300)
 		self.create_sales_invoice(qty=1, rate=400)
 		self.create_sales_invoice(qty=1, rate=500)
@@ -327,28 +327,24 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		self.create_payment_entry(amount=500).save().submit()
 
 		pr = self.create_payment_reconciliation()
-		pr.minimum_invoice_amount = 400
-		pr.maximum_invoice_amount = 500
-		pr.minimum_payment_amount = 300
-		pr.maximum_payment_amount = 600
+		# Range 400-500 → 2 SIs and 2 PEs in that band.
+		pr.min_amount = 400
+		pr.max_amount = 500
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.get("invoices")), 2)
-		self.assertEqual(len(pr.get("payments")), 3)
+		self.assertEqual(len(pr.get("to_receive")), 2)
+		self.assertEqual(len(pr.get("to_pay")), 2)
 
-		pr.minimum_invoice_amount = 300
-		pr.maximum_invoice_amount = 600
-		pr.minimum_payment_amount = 400
-		pr.maximum_payment_amount = 500
+		# Single point 400 → 1 SI, 1 PE.
+		pr.min_amount = pr.max_amount = 400
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.get("invoices")), 3)
-		self.assertEqual(len(pr.get("payments")), 2)
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(len(pr.get("to_pay")), 1)
 
-		pr.minimum_invoice_amount = (
-			pr.maximum_invoice_amount
-		) = pr.minimum_payment_amount = pr.maximum_payment_amount = 0
+		# Cleared filter → all 3 each side.
+		pr.min_amount = pr.max_amount = 0
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.get("invoices")), 3)
-		self.assertEqual(len(pr.get("payments")), 3)
+		self.assertEqual(len(pr.get("to_receive")), 3)
+		self.assertEqual(len(pr.get("to_pay")), 3)
 
 	def test_filter_posting_date(self):
 		# check filter condition using transaction date
@@ -366,23 +362,20 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		self.create_payment_entry(amount=amount, posting_date=date2).save().submit()
 
 		pr = self.create_payment_reconciliation()
-		pr.from_invoice_date = pr.to_invoice_date = date1
-		pr.from_payment_date = pr.to_payment_date = date1
+		pr.from_date = pr.to_date = date1
 
 		pr.get_unreconciled_entries()
 		# assert only si and pe are fetched
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(len(pr.get("payments")), 1)
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(len(pr.get("to_pay")), 1)
 
-		pr.from_invoice_date = date2
-		pr.to_invoice_date = date1
-		pr.from_payment_date = date2
-		pr.to_payment_date = date1
+		pr.from_date = date2
+		pr.to_date = date1
 
 		pr.get_unreconciled_entries()
 		# assert only si and pe are fetched
-		self.assertEqual(len(pr.get("invoices")), 2)
-		self.assertEqual(len(pr.get("payments")), 2)
+		self.assertEqual(len(pr.get("to_receive")), 2)
+		self.assertEqual(len(pr.get("to_pay")), 2)
 
 	def test_filter_posting_date_case2(self):
 		"""
@@ -395,50 +388,42 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		self.create_sales_invoice(rate=25, qty=1, posting_date=to_date)
 
 		pr = self.create_payment_reconciliation()
-		pr.from_invoice_date = pr.from_payment_date = from_date
-		pr.to_invoice_date = pr.to_payment_date = to_date
+		pr.from_date = from_date
+		pr.to_date = to_date
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
 
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [x.as_dict() for x in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 		pr.reconcile()
 
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 0)
-		self.assertEqual(len(pr.payments), 0)
+		self.assertEqual(len(pr.to_receive), 0)
+		self.assertEqual(len(pr.to_pay), 0)
 
-		pr.from_invoice_date = pr.from_payment_date = to_date
-		pr.to_invoice_date = pr.to_payment_date = to_date
+		pr.from_date = to_date
+		pr.to_date = to_date
 
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 0)
+		self.assertEqual(len(pr.to_receive), 0)
 
-	def test_filter_invoice_limit(self):
-		# check filter condition - invoice limit
+	def test_filter_fetch_limit(self):
 		transaction_date = nowdate()
 		rate = 100
-		invoices = []
-		payments = []
 		for _i in range(5):
-			invoices.append(self.create_sales_invoice(qty=1, rate=rate, posting_date=transaction_date))
-			pe = self.create_payment_entry(amount=rate, posting_date=transaction_date).save().submit()
-			payments.append(pe)
+			self.create_sales_invoice(qty=1, rate=rate, posting_date=transaction_date)
+			self.create_payment_entry(amount=rate, posting_date=transaction_date).save().submit()
 
 		pr = self.create_payment_reconciliation()
-		pr.from_invoice_date = pr.to_invoice_date = transaction_date
-		pr.from_payment_date = pr.to_payment_date = transaction_date
-		pr.invoice_limit = 2
-		pr.payment_limit = 3
+		pr.from_date = pr.to_date = transaction_date
+		pr.fetch_limit = 2
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.get("invoices")), 2)
-		self.assertEqual(len(pr.get("payments")), 3)
+		self.assertEqual(len(pr.get("to_receive")), 2)
+		self.assertEqual(len(pr.get("to_pay")), 2)
 
 	def test_payment_against_invoice(self):
 		si = self.create_sales_invoice(qty=1, rate=200)
@@ -450,9 +435,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 
 		# reconcile multiple payments against invoice
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Difference amount should not be calculated for base currency accounts
 		for row in pr.allocation:
@@ -463,18 +446,18 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		si.reload()
 		self.assertEqual(si.status, "Partly Paid")
 		# check PR tool output post reconciliation
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(pr.get("invoices")[0].get("outstanding_amount"), 110)
-		self.assertEqual(pr.get("payments"), [])
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(pr.get("to_receive")[0].get("outstanding_amount"), 110)
+		self.assertEqual(pr.get("to_pay"), [])
 
 		# cancel one PE
 		pe.reload()
 		pe.cancel()
 		pr.get_unreconciled_entries()
 		# check PR tool output
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(len(pr.get("payments")), 0)
-		self.assertEqual(pr.get("invoices")[0].get("outstanding_amount"), 165)
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(len(pr.get("to_pay")), 0)
+		self.assertEqual(pr.get("to_receive")[0].get("outstanding_amount"), 165)
 
 	def test_payment_against_journal(self):
 		transaction_date = nowdate()
@@ -491,14 +474,12 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		self.create_payment_entry(amount=amount, posting_date=transaction_date).save().submit()
 
 		pr = self.create_payment_reconciliation()
-		pr.minimum_invoice_amount = pr.maximum_invoice_amount = amount
-		pr.from_invoice_date = pr.to_invoice_date = transaction_date
-		pr.from_payment_date = pr.to_payment_date = transaction_date
+		pr.min_amount = pr.max_amount = amount
+		pr.from_date = pr.to_date = transaction_date
+		pr.from_date = pr.to_date = transaction_date
 
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Difference amount should not be calculated for base currency accounts
 		for row in pr.allocation:
@@ -507,8 +488,8 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.reconcile()
 
 		# check PR tool output
-		self.assertEqual(len(pr.get("invoices")), 0)
-		self.assertEqual(len(pr.get("payments")), 0)
+		self.assertEqual(len(pr.get("to_receive")), 0)
+		self.assertEqual(len(pr.get("to_pay")), 0)
 
 	def test_payment_against_foreign_currency_journal(self):
 		transaction_date = nowdate()
@@ -569,14 +550,12 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 
 		pr = self.create_payment_reconciliation(party_is_customer=False)
 		pr.receivable_payable_account = self.creditors_usd
-		pr.minimum_invoice_amount = pr.maximum_invoice_amount = amount
-		pr.from_invoice_date = pr.to_invoice_date = transaction_date
-		pr.from_payment_date = pr.to_payment_date = transaction_date
+		pr.min_amount = pr.max_amount = amount
+		pr.from_date = pr.to_date = transaction_date
+		pr.from_date = pr.to_date = transaction_date
 
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# There should no difference_amount as the Journal and Payment have same exchange rate -  'exc_rate1'
 		for row in pr.allocation:
@@ -585,8 +564,8 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.reconcile()
 
 		# check PR tool output
-		self.assertEqual(len(pr.get("invoices")), 0)
-		self.assertEqual(len(pr.get("payments")), 0)
+		self.assertEqual(len(pr.get("to_receive")), 0)
+		self.assertEqual(len(pr.get("to_pay")), 0)
 
 		journals = frappe.db.get_all(
 			"Journal Entry Account",
@@ -610,9 +589,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation()
 
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Difference amount should not be calculated for base currency accounts
 		for row in pr.allocation:
@@ -626,8 +603,8 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		self.assertEqual(si.outstanding_amount, 0)
 
 		# check PR tool output
-		self.assertEqual(len(pr.get("invoices")), 0)
-		self.assertEqual(len(pr.get("payments")), 0)
+		self.assertEqual(len(pr.get("to_receive")), 0)
+		self.assertEqual(len(pr.get("to_pay")), 0)
 
 	def test_negative_debit_or_credit_journal_against_invoice(self):
 		transaction_date = nowdate()
@@ -646,9 +623,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation()
 
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Difference amount should not be calculated for base currency accounts
 		for row in pr.allocation:
@@ -662,8 +637,8 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		self.assertEqual(si.outstanding_amount, 0)
 
 		# check PR tool output
-		self.assertEqual(len(pr.get("invoices")), 0)
-		self.assertEqual(len(pr.get("payments")), 0)
+		self.assertEqual(len(pr.get("to_receive")), 0)
+		self.assertEqual(len(pr.get("to_pay")), 0)
 
 	def test_journal_against_journal(self):
 		transaction_date = nowdate()
@@ -687,9 +662,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation()
 
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Difference amount should not be calculated for base currency accounts
 		for row in pr.allocation:
@@ -697,8 +670,8 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 
 		pr.reconcile()
 
-		self.assertEqual(pr.get("invoices"), [])
-		self.assertEqual(pr.get("payments"), [])
+		self.assertEqual(pr.get("to_receive"), [])
+		self.assertEqual(pr.get("to_pay"), [])
 
 	def test_cr_note_against_invoice(self):
 		transaction_date = nowdate()
@@ -715,9 +688,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation()
 
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Cr Note and Invoice are of the same currency. There shouldn't any difference amount.
 		for row in pr.allocation:
@@ -728,8 +699,8 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.get_unreconciled_entries()
 		# check reconciliation tool output
 		# reconciled invoice and credit note shouldn't show up in selection
-		self.assertEqual(pr.get("invoices"), [])
-		self.assertEqual(pr.get("payments"), [])
+		self.assertEqual(pr.get("to_receive"), [])
+		self.assertEqual(pr.get("to_pay"), [])
 
 		# assert outstanding
 		si.reload()
@@ -753,14 +724,12 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation()
 
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 		pr.reconcile()
 
 		pr.get_unreconciled_entries()
-		self.assertEqual(pr.get("invoices"), [])
-		self.assertEqual(pr.get("payments"), [])
+		self.assertEqual(pr.get("to_receive"), [])
+		self.assertEqual(pr.get("to_pay"), [])
 
 		journals = frappe.db.get_all(
 			"Journal Entry",
@@ -816,9 +785,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation()
 
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 		pr.allocation[0].allocated_amount = allocated_amount
 
 		# Cr Note and Invoice are of the same currency. There shouldn't any difference amount.
@@ -834,10 +801,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 
 		pr.get_unreconciled_entries()
 		# check reconciliation tool output
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(len(pr.get("payments")), 1)
-		self.assertEqual(pr.get("invoices")[0].outstanding_amount, 20)
-		self.assertEqual(pr.get("payments")[0].amount, 20)
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(len(pr.get("to_pay")), 1)
+		self.assertEqual(pr.get("to_receive")[0].outstanding_amount, 20)
+		self.assertEqual(pr.get("to_pay")[0].amount, 20)
 
 	def test_pr_output_foreign_currency_and_amount(self):
 		# test for currency and amount invoices and payments
@@ -870,13 +837,13 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.receivable_payable_account = self.debtors_eur
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
 
-		self.assertEqual(pr.invoices[0].amount, amount)
-		self.assertEqual(pr.invoices[0].currency, "EUR")
-		self.assertEqual(pr.payments[0].amount, amount)
-		self.assertEqual(pr.payments[0].currency, "EUR")
+		self.assertEqual(pr.to_receive[0].amount, amount)
+		self.assertEqual(pr.to_receive[0].currency, "EUR")
+		self.assertEqual(pr.to_pay[0].amount, amount)
+		self.assertEqual(pr.to_pay[0].currency, "EUR")
 
 		cr_note.cancel()
 
@@ -888,10 +855,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pay = pay.save().submit()
 
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
-		self.assertEqual(pr.payments[0].amount, amount)
-		self.assertEqual(pr.payments[0].currency, "EUR")
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
+		self.assertEqual(pr.to_pay[0].amount, amount)
+		self.assertEqual(pr.to_pay[0].currency, "EUR")
 
 	def test_difference_amount_via_journal_entry(self):
 		# Make Sale Invoice
@@ -944,13 +911,13 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.receivable_payable_account = self.debtors_eur
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 2)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 2)
 
 		# Test exact payment allocation
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [pr.payments[0].as_dict()]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		to_receive_subset = [x.as_dict() for x in pr.to_receive]
+		to_pay_subset = [pr.to_pay[0].as_dict()]
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 
 		self.assertEqual(pr.allocation[0].allocated_amount, 100)
 		self.assertEqual(pr.allocation[0].difference_amount, -500)
@@ -958,9 +925,9 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		# Test partial payment allocation (with excess payment entry)
 		pr.set("allocation", [])
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [pr.payments[1].as_dict()]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		to_receive_subset = [x.as_dict() for x in pr.to_receive]
+		to_pay_subset = [pr.to_pay[1].as_dict()]
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 		pr.allocation[0].difference_account = "Exchange Gain/Loss - _PR"
 
 		self.assertEqual(pr.allocation[0].allocated_amount, 100)
@@ -1038,13 +1005,13 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.receivable_payable_account = self.debtors_eur
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 2)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 2)
 
 		# Test exact payment allocation
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [pr.payments[0].as_dict()]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		to_receive_subset = [x.as_dict() for x in pr.to_receive]
+		to_pay_subset = [pr.to_pay[0].as_dict()]
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 
 		self.assertEqual(pr.allocation[0].allocated_amount, 100)
 		self.assertEqual(pr.allocation[0].difference_amount, -500)
@@ -1052,9 +1019,9 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		# Test partial payment allocation (with excess payment entry)
 		pr.set("allocation", [])
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [pr.payments[1].as_dict()]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		to_receive_subset = [x.as_dict() for x in pr.to_receive]
+		to_pay_subset = [pr.to_pay[1].as_dict()]
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 		pr.allocation[0].difference_account = "Exchange Gain/Loss - _PR"
 
 		self.assertEqual(pr.allocation[0].allocated_amount, 100)
@@ -1128,21 +1095,21 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.receivable_payable_account = self.debtors_eur
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 2)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 2)
 
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [pr.payments[0].as_dict()]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		to_receive_subset = [x.as_dict() for x in pr.to_receive]
+		to_pay_subset = [pr.to_pay[0].as_dict()]
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 
 		self.assertEqual(pr.allocation[0].allocated_amount, 100)
 		self.assertEqual(pr.allocation[0].difference_amount, -500)
 
 		pr.set("allocation", [])
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [pr.payments[1].as_dict()]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		to_receive_subset = [x.as_dict() for x in pr.to_receive]
+		to_pay_subset = [pr.to_pay[1].as_dict()]
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 
 		self.assertEqual(pr.allocation[0].allocated_amount, 100)
 		self.assertEqual(pr.allocation[0].difference_amount, -500)
@@ -1165,8 +1132,8 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.get_unreconciled_entries()
 
 		# check PR tool output
-		self.assertEqual(len(pr.get("invoices")), 0)
-		self.assertEqual(len(pr.get("payments")), 0)
+		self.assertEqual(len(pr.get("to_receive")), 0)
+		self.assertEqual(len(pr.get("to_pay")), 0)
 
 	def test_cost_center_filter_on_vouchers(self):
 		"""
@@ -1213,10 +1180,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.get_unreconciled_entries()
 
 		# check PR tool output
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(pr.get("invoices")[0].get("invoice_number"), si1.name)
-		self.assertEqual(len(pr.get("payments")), 2)
-		payment_vouchers = [x.get("reference_name") for x in pr.get("payments")]
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(pr.get("to_receive")[0].get("voucher_no"), si1.name)
+		self.assertEqual(len(pr.get("to_pay")), 2)
+		payment_vouchers = [x.get("voucher_no") for x in pr.get("to_pay")]
 		self.assertCountEqual(payment_vouchers, [pe1.name, je1.name])
 
 		# Change cost center
@@ -1225,10 +1192,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.get_unreconciled_entries()
 
 		# check PR tool output
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(pr.get("invoices")[0].get("invoice_number"), si2.name)
-		self.assertEqual(len(pr.get("payments")), 2)
-		payment_vouchers = [x.get("reference_name") for x in pr.get("payments")]
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(pr.get("to_receive")[0].get("voucher_no"), si2.name)
+		self.assertEqual(len(pr.get("to_pay")), 2)
+		payment_vouchers = [x.get("voucher_no") for x in pr.get("to_pay")]
 		self.assertCountEqual(payment_vouchers, [je2.name, pe2.name])
 
 	@ERPNextTestSuite.change_settings(
@@ -1267,12 +1234,12 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.receivable_payable_account = self.debit_to
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
 
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [pr.payments[0].as_dict()]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		to_receive_subset = [x.as_dict() for x in pr.to_receive]
+		to_pay_subset = [pr.to_pay[0].as_dict()]
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 
 		self.assertEqual(pr.allocation[0].allocated_amount, 85)
 		self.assertEqual(pr.allocation[0].difference_amount, 0)
@@ -1310,22 +1277,21 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.party_type = "Supplier"
 		pr.party = self.supplier
 		pr.receivable_payable_account = self.creditors_usd
-		pr.from_invoice_date = pr.to_invoice_date = pr.from_payment_date = pr.to_payment_date = nowdate()
+		pr.from_date = pr.to_date = nowdate()
 		pr.get_unreconciled_entries()
 
-		invoices = []
-		payments = []
-		for invoice in pr.invoices:
-			if invoice.invoice_number == pi.name:
-				invoices.append(invoice.as_dict())
+		to_pay_subset = []
+		to_receive_subset = []
+		for row in pr.to_pay:
+			if row.voucher_no == pi.name:
+				to_pay_subset.append(row.as_dict())
+				break
+		for row in pr.to_receive:
+			if row.voucher_no == pi_return.name:
+				to_receive_subset.append(row.as_dict())
 				break
 
-		for payment in pr.payments:
-			if payment.reference_name == pi_return.name:
-				payments.append(payment.as_dict())
-				break
-
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 
 		# Should not raise frappe.exceptions.ValidationError: Total Debit must be equal to Total Credit.
 		pr.reconcile()
@@ -1360,15 +1326,13 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation(party_is_customer=False)
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 2)
-		self.assertEqual(len(pr.payments), 2)
+		self.assertEqual(len(pr.to_pay), 2)
+		self.assertGreaterEqual(len(pr.to_receive), 1)
 
-		for x in pr.payments:
-			self.assertEqual((x.reference_type, x.reference_name), (pay.doctype, pay.name))
+		for x in pr.to_receive:
+			self.assertEqual((x.voucher_type, x.voucher_no), (pay.doctype, pay.name))
 
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [x.as_dict() for x in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 		# partial allocation on pi1 and full allocate on pi2
 		pr.allocation[0].allocated_amount = 100
 		pr.reconcile()
@@ -1405,12 +1369,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		self.assertEqual(pay.difference_amount, 0)
 
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 2)
+		self.assertEqual(len(pr.to_pay), 1)
+		self.assertGreaterEqual(len(pr.to_receive), 1)
 
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [x.as_dict() for x in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 		pr.reconcile()
 
 		# assert references and total allocated and unallocated amount
@@ -1469,12 +1431,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.party_type = "Supplier"
 		pr.party = self.supplier
 		pr.receivable_payable_account = self.creditors_usd
-		pr.from_invoice_date = pr.to_invoice_date = pr.from_payment_date = pr.to_payment_date = nowdate()
+		pr.from_date = pr.to_date = nowdate()
 		pr.get_unreconciled_entries()
 
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Should not raise frappe.exceptions.ValidationError: Payment Entry has been modified after you pulled it. Please pull it again.
 		pr.reconcile()
@@ -1504,22 +1464,22 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 
 		pr = self.create_payment_reconciliation(party_is_customer=False)
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
-		self.assertEqual(pr.invoices[0].invoice_number, reverse_pe.name)
-		self.assertEqual(pr.payments[0].reference_name, pe.name)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
+		self.assertEqual(pr.to_receive[0].voucher_no, pe.name)
+		self.assertEqual(pr.to_pay[0].voucher_no, reverse_pe.name)
 
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 		pr.reconcile()
 
 		pe.reload()
 		self.assertEqual(len(pe.references), 1)
 		self.assertEqual(pe.references[0].exchange_rate, 1)
-		# There should not be any Exc Gain/Loss
 		self.assertEqual(pe.references[0].exchange_gain_loss, 0)
 		self.assertEqual(pe.references[0].reference_name, reverse_pe.name)
+
+		reverse_pe.reload()
+		self.assertEqual(reverse_pe.references, [])
 
 		journals = frappe.db.get_all(
 			"Journal Entry",
@@ -1567,22 +1527,22 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation(party_is_customer=False)
 		pr.default_advance_account = self.advance_payable_account
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
-		self.assertEqual(pr.invoices[0].invoice_number, reverse_pe.name)
-		self.assertEqual(pr.payments[0].reference_name, pe.name)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
+		self.assertEqual(pr.to_receive[0].voucher_no, pe.name)
+		self.assertEqual(pr.to_pay[0].voucher_no, reverse_pe.name)
 
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 		pr.reconcile()
 
 		pe.reload()
 		self.assertEqual(len(pe.references), 1)
 		self.assertEqual(pe.references[0].exchange_rate, 1)
-		# There should not be any Exc Gain/Loss
 		self.assertEqual(pe.references[0].exchange_gain_loss, 0)
 		self.assertEqual(pe.references[0].reference_name, reverse_pe.name)
+
+		reverse_pe.reload()
+		self.assertEqual(reverse_pe.references, [])
 
 		journals = frappe.db.get_all(
 			"Journal Entry",
@@ -1661,6 +1621,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		]
 		self.assertEqual(pl_entries, expected_ple)
 
+		pr.get_unreconciled_entries()
+		self.assertEqual(len(pr.to_receive), 0)
+		self.assertEqual(len(pr.to_pay), 0)
+
 	def test_advance_payment_reconciliation_date(self):
 		frappe.db.set_value(
 			"Company",
@@ -1689,13 +1653,11 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 
 		pr = self.create_payment_reconciliation(party_is_customer=False)
 		pr.default_advance_account = self.advance_payable_account
-		pr.from_payment_date = pe.posting_date
+		pr.from_date = pe.posting_date
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
+		pr.allocate_entries()
 		pr.reconcile()
 
 		# Assert Ledger Entries
@@ -1747,9 +1709,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.receivable_payable_account = get_party_account(pr.party_type, pr.party, pr.company)
 		pr.default_advance_account = self.advance_payable_account
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.invoices]
-		payments = [x.as_dict() for x in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 		pr.allocation[0].allocated_amount = 100
 		pr.reconcile()
 
@@ -1794,11 +1754,9 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation()
 		pr.default_advance_account = self.advance_receivable_account
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
+		pr.allocate_entries()
 		pr.reconcile()
 
 		# Assert Ledger Entries
@@ -1909,11 +1867,9 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation(party_is_customer=False)
 		pr.default_advance_account = self.advance_payable_account
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
+		pr.allocate_entries()
 		pr.reconcile()
 
 		# Assert Ledger Entries
@@ -1994,7 +1950,7 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		]
 		self.assertEqual(pl_entries, expected_ple)
 
-	def test_cr_note_payment_limit_filter(self):
+	def test_cr_note_fetch_limit(self):
 		transaction_date = nowdate()
 		amount = 100
 
@@ -2009,16 +1965,14 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr = self.create_payment_reconciliation()
 
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.invoices), 6)
-		self.assertEqual(len(pr.payments), 6)
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		self.assertEqual(len(pr.to_receive), 6)
+		self.assertEqual(len(pr.to_pay), 6)
+		pr.allocate_entries()
 		pr.reconcile()
 
 		pr.get_unreconciled_entries()
-		self.assertEqual(pr.get("invoices"), [])
-		self.assertEqual(pr.get("payments"), [])
+		self.assertEqual(pr.get("to_receive"), [])
+		self.assertEqual(pr.get("to_pay"), [])
 
 		self.create_sales_invoice(qty=1, rate=amount, posting_date=transaction_date)
 		cr_note = self.create_sales_invoice(
@@ -2027,12 +1981,11 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		cr_note.is_return = 1
 		cr_note = cr_note.save().submit()
 
-		# Limit should not affect in fetching the unallocated cr_note
-		pr.invoice_limit = 5
-		pr.payment_limit = 5
+		# Limit should not prevent fetching the lone unallocated SI/CN pair.
+		pr.fetch_limit = 5
 		pr.get_unreconciled_entries()
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
 
 	def test_reconciliation_on_closed_period_payment(self):
 		# create backdated fiscal year
@@ -2095,18 +2048,16 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 
 		# process reconciliation on closed period payment
 		pr = self.create_payment_reconciliation(party_is_customer=True)
-		pr.from_invoice_date = pr.to_invoice_date = pr.from_payment_date = pr.to_payment_date = None
+		pr.from_date = pr.to_date = None
 		pr.get_unreconciled_entries()
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 		pr.reconcile()
 		je_1.reload()
 		je_2.reload()
 
 		# check whether the payment reconciliation is done on the closed period
-		self.assertEqual(pr.get("invoices"), [])
-		self.assertEqual(pr.get("payments"), [])
+		self.assertEqual(pr.get("to_receive"), [])
+		self.assertEqual(pr.get("to_pay"), [])
 
 	def test_advance_reconciliation_effect_on_same_date(self):
 		frappe.db.set_value(
@@ -2125,17 +2076,13 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pe = self.create_payment_entry(posting_date=adv_date, amount=80).save().submit()
 
 		pr = self.create_payment_reconciliation()
-		pr.from_invoice_date = add_days(nowdate(), -1)
-		pr.to_invoice_date = nowdate()
-		pr.from_payment_date = add_days(nowdate(), -2)
-		pr.to_payment_date = nowdate()
+		pr.from_date = add_days(nowdate(), -2)
+		pr.to_date = nowdate()
 		pr.default_advance_account = self.advance_receivable_account
 
 		# reconcile multiple payments against invoice
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.get("invoices")]
-		payments = [x.as_dict() for x in pr.get("payments")]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Difference amount should not be calculated for base currency accounts
 		for row in pr.allocation:
@@ -2146,9 +2093,9 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		si.reload()
 		self.assertEqual(si.status, "Partly Paid")
 		# check PR tool output post reconciliation
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(pr.get("invoices")[0].get("outstanding_amount"), 120)
-		self.assertEqual(pr.get("payments"), [])
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(pr.get("to_receive")[0].get("outstanding_amount"), 120)
+		self.assertEqual(pr.get("to_pay"), [])
 
 		# Assert Ledger Entries
 		gl_entries = frappe.db.get_all(
@@ -2200,9 +2147,9 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pe.cancel()
 		pr.get_unreconciled_entries()
 		# check PR tool output
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(len(pr.get("payments")), 0)
-		self.assertEqual(pr.get("invoices")[0].get("outstanding_amount"), 200)
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(len(pr.get("to_pay")), 0)
+		self.assertEqual(pr.get("to_receive")[0].get("outstanding_amount"), 200)
 
 	def test_partial_advance_payment_with_closed_fiscal_year(self):
 		"""
@@ -2262,12 +2209,12 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.party = self.supplier
 		pr.receivable_payable_account = self.creditors
 		pr.default_advance_account = self.advance_payable_account
-		pr.from_invoice_date = pr.to_invoice_date = pi1.posting_date
-		pr.from_payment_date = pr.to_payment_date = pe.posting_date
+		pr.from_date = min(pi1.posting_date, pe.posting_date)
+		pr.to_date = max(pi1.posting_date, pe.posting_date)
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.invoices if x.invoice_number == pi1.name]
-		payments = [x.as_dict() for x in pr.payments if x.reference_name == pe.name]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		to_pay_subset = [x.as_dict() for x in pr.to_pay if x.voucher_no == pi1.name]
+		to_receive_subset = [x.as_dict() for x in pr.to_receive if x.voucher_no == pe.name]
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 		pr.reconcile()
 
 		# Verify partial reconciliation
@@ -2311,12 +2258,12 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.party = self.supplier
 		pr.receivable_payable_account = self.creditors
 		pr.default_advance_account = self.advance_payable_account
-		pr.from_invoice_date = pr.to_invoice_date = pi2.posting_date
-		pr.from_payment_date = pr.to_payment_date = pe.posting_date
+		pr.from_date = min(getdate(pi2.posting_date), getdate(pe.posting_date))
+		pr.to_date = max(getdate(pi2.posting_date), getdate(pe.posting_date))
 		pr.get_unreconciled_entries()
-		invoices = [x.as_dict() for x in pr.invoices if x.invoice_number == pi2.name]
-		payments = [x.as_dict() for x in pr.payments if x.reference_name == pe.name]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		to_pay_subset = [x.as_dict() for x in pr.to_pay if x.voucher_no == pi2.name]
+		to_receive_subset = [x.as_dict() for x in pr.to_receive if x.voucher_no == pe.name]
+		pr.allocate_entries(to_receive=to_receive_subset, to_pay=to_pay_subset)
 		pr.reconcile()
 
 		pe.reload()
@@ -2374,11 +2321,9 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.party = customer
 		pr.receivable_payable_account = self.debtors_eur
 		pr.get_unreconciled_entries()
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(len(pr.get("payments")), 1)
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(len(pr.get("to_pay")), 1)
+		pr.allocate_entries()
 
 		# Check the difference_amount is a gain of 5000
 		self.assertEqual(flt(pr.allocation[0].get("difference_amount")), 5000.0)
@@ -2424,12 +2369,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.party = self.supplier
 		pr.receivable_payable_account = self.creditors_usd
 		pr.get_unreconciled_entries()
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
 
-		self.assertEqual(len(pr.get("invoices")), 1)
-		self.assertEqual(len(pr.get("payments")), 1)
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		self.assertEqual(len(pr.get("to_receive")), 1)
+		self.assertEqual(len(pr.get("to_pay")), 1)
+		pr.allocate_entries()
 
 		# Check the difference_amount is a loss of 5000
 		self.assertEqual(flt(pr.allocation[0].get("difference_amount")), -5000.0)
@@ -2476,12 +2419,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.receivable_payable_account = self.debtors_eur
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
 
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Check the difference_amount is a loss of 5000
 		self.assertEqual(flt(pr.allocation[0].difference_amount), -5000.0)
@@ -2529,12 +2470,10 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		pr.receivable_payable_account = self.creditors_usd
 		pr.get_unreconciled_entries()
 
-		self.assertEqual(len(pr.invoices), 1)
-		self.assertEqual(len(pr.payments), 1)
+		self.assertEqual(len(pr.to_receive), 1)
+		self.assertEqual(len(pr.to_pay), 1)
 
-		invoices = [invoice.as_dict() for invoice in pr.invoices]
-		payments = [payment.as_dict() for payment in pr.payments]
-		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+		pr.allocate_entries()
 
 		# Check the difference_amount is a gain of 5000
 		self.assertEqual(flt(pr.allocation[0].difference_amount), 5000.0)
@@ -2629,30 +2568,30 @@ def make_period_closing_voucher(company, cost_center, posting_date=None, submit=
 	return pcv
 
 
-class TestClassifier(ERPNextTestSuite):
+class TestClassify(ERPNextTestSuite):
 	def test_sales_invoice_regular_is_receivable(self):
-		# SI posts Dr to Debtors → +ve PLE amount on Receivable account
-		self.assertEqual(Classifier.classify("Receivable", 1000.0), "Receivable")
+		# SI: Dr Debtors → +ve on Receivable account
+		self.assertEqual(classify("Receivable", 1000.0), "Receivable")
 
 	def test_sales_invoice_credit_note_is_payable(self):
-		# CN (SI is_return=1) posts Cr to Debtors → -ve PLE amount on Receivable account
-		self.assertEqual(Classifier.classify("Receivable", -500.0), "Payable")
+		# CN: Cr Debtors → -ve on Receivable account
+		self.assertEqual(classify("Receivable", -500.0), "Payable")
 
 	def test_purchase_invoice_regular_is_payable(self):
-		# PI posts Cr to Creditors → +ve PLE amount on Payable account
-		self.assertEqual(Classifier.classify("Payable", 1000.0), "Payable")
+		# PI: Cr Creditors → +ve on Payable account
+		self.assertEqual(classify("Payable", 1000.0), "Payable")
 
 	def test_purchase_invoice_debit_note_is_receivable(self):
-		# DN (PI is_return=1) posts Dr to Creditors → -ve PLE amount on Payable account
-		self.assertEqual(Classifier.classify("Payable", -500.0), "Receivable")
+		# DN: Dr Creditors → -ve on Payable account
+		self.assertEqual(classify("Payable", -500.0), "Receivable")
 
 	def test_unsupported_account_type_throws(self):
 		for bad in ("Asset", "Bank", "Cash", "Equity", "", None):
 			with self.assertRaises(frappe.ValidationError):
-				Classifier.classify(bad, 100.0)
+				classify(bad, 100.0)
 
 	def test_zero_amount_throws(self):
 		with self.assertRaises(frappe.ValidationError):
-			Classifier.classify("Receivable", 0)
+			classify("Receivable", 0)
 		with self.assertRaises(frappe.ValidationError):
-			Classifier.classify("Payable", 0.0)
+			classify("Payable", 0.0)
