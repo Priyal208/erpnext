@@ -464,7 +464,10 @@ class AccountsController(TransactionBase):
 			).run()
 
 	def on_trash(self):
-		from erpnext.accounts.utils import delete_exchange_gain_loss_journal
+		from erpnext.accounts.utils import (
+			CROSS_ACCOUNT_BRIDGE_VOUCHER_TYPE,
+			get_linked_system_journals,
+		)
 
 		self._remove_references_in_repost_doctypes()
 		self._remove_references_in_unreconcile()
@@ -472,8 +475,13 @@ class AccountsController(TransactionBase):
 
 		# delete sl and gl entries on deletion of transaction
 		if frappe.get_single_value("Accounts Settings", "delete_linked_ledger_entries"):
-			# delete linked exchange gain/loss journal
-			delete_exchange_gain_loss_journal(self)
+			for name in get_linked_system_journals(
+				self.doctype,
+				self.name,
+				["Exchange Gain Or Loss", CROSS_ACCOUNT_BRIDGE_VOUCHER_TYPE],
+				docstatus=2,
+			):
+				frappe.delete_doc("Journal Entry", name, force=1, ignore_permissions=True)
 
 			ple = frappe.qb.DocType("Payment Ledger Entry")
 			frappe.qb.from_(ple).delete().where(
@@ -1750,7 +1758,7 @@ class AccountsController(TransactionBase):
 								arg.get("referenced_row"),
 							):
 								posting_date = arg.get("difference_posting_date") or frappe.db.get_value(
-									arg.voucher_type, arg.voucher_no, "posting_date"
+									arg.writable_voucher_type, arg.writable_voucher_no, "posting_date"
 								)
 								je = create_gain_loss_journal(
 									self.company,
@@ -1762,8 +1770,8 @@ class AccountsController(TransactionBase):
 									difference_amount,
 									dr_or_cr,
 									reverse_dr_or_cr,
-									arg.get("against_voucher_type"),
-									arg.get("against_voucher"),
+									arg.get("non_writable_voucher_type"),
+									arg.get("non_writable_voucher_no"),
 									arg.get("idx"),
 									self.doctype,
 									self.name,
@@ -1783,8 +1791,6 @@ class AccountsController(TransactionBase):
 				gain_loss_to_book = [x for x in self.references if x.exchange_gain_loss != 0]
 				booked = []
 				if gain_loss_to_book:
-					[x.reference_doctype for x in gain_loss_to_book]
-					[x.reference_name for x in gain_loss_to_book]
 					je = qb.DocType("Journal Entry")
 					jea = qb.DocType("Journal Entry Account")
 					parents = (
@@ -1808,15 +1814,17 @@ class AccountsController(TransactionBase):
 							.where(
 								(je.docstatus == 1)
 								& (je.name.isin(parents))
-								& (je.voucher_type == "Exchange Gain or Loss")
+								& (je.voucher_type == "Exchange Gain Or Loss")
 							)
 							.run()
 						)
 
 				for d in gain_loss_to_book:
-					# Filter out References for which Gain/Loss is already booked
+					# Filter out References for which Gain/Loss is already booked.
+					# Key on the PE.references row's stable `name`, not the volatile
+					# `idx` (renumbered by `clear_unallocated_reference_document_rows`).
 					if d.exchange_gain_loss and (
-						(d.reference_doctype, d.reference_name, str(d.idx)) not in booked
+						(d.reference_doctype, d.reference_name, d.name) not in booked
 					):
 						if self.book_advance_payments_in_separate_party_account:
 							party_account = d.account
@@ -1849,10 +1857,10 @@ class AccountsController(TransactionBase):
 							reverse_dr_or_cr,
 							d.reference_doctype,
 							d.reference_name,
-							d.idx,
+							d.name,
 							self.doctype,
 							self.name,
-							d.idx,
+							d.name,
 							self.cost_center,
 							dimensions_dict,
 							self.project,
@@ -1895,11 +1903,11 @@ class AccountsController(TransactionBase):
 			if flt(d.allocated_amount) > 0:
 				args = frappe._dict(
 					{
-						"voucher_type": d.reference_type,
-						"voucher_no": d.reference_name,
-						"voucher_detail_no": d.reference_row,
-						"against_voucher_type": self.doctype,
-						"against_voucher": self.name,
+						"writable_voucher_type": d.reference_type,
+						"writable_voucher_no": d.reference_name,
+						"writable_voucher_detail_no": d.reference_row,
+						"non_writable_voucher_type": self.doctype,
+						"non_writable_voucher_no": self.name,
 						"account": party_account,
 						"party_type": party_type,
 						"party": party,
@@ -1938,24 +1946,6 @@ class AccountsController(TransactionBase):
 					if self.get(dim.fieldname):
 						x.update({dim.fieldname: self.get(dim.fieldname)})
 			reconcile_against_document(lst, active_dimensions=active_dimensions)
-
-	def cancel_system_generated_credit_debit_notes(self):
-		# Cancel 'Credit/Debit' Note Journal Entries, if found.
-		if self.doctype in ["Sales Invoice", "Purchase Invoice"]:
-			voucher_type = "Credit Note" if self.doctype == "Sales Invoice" else "Debit Note"
-			journals = frappe.db.get_all(
-				"Journal Entry",
-				filters={
-					"is_system_generated": 1,
-					"reference_type": self.doctype,
-					"reference_name": self.name,
-					"voucher_type": voucher_type,
-					"docstatus": 1,
-				},
-				pluck="name",
-			)
-			for x in journals:
-				frappe.get_doc("Journal Entry", x).cancel()
 
 	def on_cancel(self):
 		from erpnext.accounts.doctype.bank_transaction.bank_transaction import (
